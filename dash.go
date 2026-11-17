@@ -112,11 +112,17 @@ func (r *Dasher) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc, 
 	r.sgm = r // Use the full dasher
 }
 
-//Stop terminates a dashed line
+// Stop terminates a dashed line
 func (r *Dasher) Stop(isClosed bool) {
 	if len(r.Dashes) == 0 {
 		r.Stroker.Stop(isClosed)
 		return
+	}
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		// Asymmetric placement needs the complete contour and is incompatible
+		// with dash segmentation; clear the buffered path before signalling.
+		r.buf = r.buf[:0]
+		panic(ErrDashedStrokePlacement)
 	}
 	if r.inStroke == false {
 		return
@@ -135,7 +141,7 @@ func (r *Dasher) Stop(isClosed bool) {
 		ra.Start(a.Add(r.ln))
 		ra.Line(r.firstP.P.Add(r.firstP.TNorm))
 		r.Joiner(r.firstP)
-		r.firstP.blackWidowMark(ra)
+		r.blackWidowMark(ra, r.firstP)
 	} else { // Cap open ends
 		if !r.dashIsGap {
 			r.CapL(ra, r.leadPoint.P, r.leadPoint.TNorm)

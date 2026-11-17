@@ -5,6 +5,7 @@
 package rasterx
 
 import (
+	"errors"
 	"math"
 
 	"golang.org/x/image/math/fixed"
@@ -16,6 +17,38 @@ const (
 	// fixed point t paramaterization shift factor;
 	// (2^this)/64 is the max length of t for fixed.Int26_6
 	tStrokeShift = 14
+)
+
+// StrokeMode selects on which side of a closed, simple (non-self-intersecting)
+// contour the stroke band is placed.
+type StrokeMode uint8
+
+const (
+	// StrokeCenter is the default SVG style stroke: the path runs through the
+	// middle of the stroke band, which extends width/2 to both sides.
+	StrokeCenter StrokeMode = iota
+	// StrokeInside places the full stroke width on the interior side of the
+	// contour. The outer boundary of the fill region keeps its original size.
+	StrokeInside
+	// StrokeOutside places the full stroke width on the exterior side of the
+	// contour. The inner boundary of the stroke keeps its original size.
+	StrokeOutside
+)
+
+// Errors returned (as panic values) when a stroke placement cannot be applied.
+var (
+	// ErrOpenPathStroke is returned when an inside or outside stroke is
+	// requested on an open path; those placements are only defined for closed
+	// contours. Center stroking an open path is unaffected and uses end caps.
+	ErrOpenPathStroke = errors.New("rasterx: inside/outside stroke requires a closed path")
+	// ErrZeroAreaStroke is returned when an inside or outside stroke is
+	// requested on a closed path with (near) zero signed area, because its
+	// interior side cannot be determined.
+	ErrZeroAreaStroke = errors.New("rasterx: inside/outside stroke requires a non-zero area closed path")
+	// ErrDashedStrokePlacement is returned when an inside or outside stroke is
+	// combined with an active dash pattern. Asymmetric stroke placement and
+	// dashing are mutually exclusive; use StrokeCenter for dashed strokes.
+	ErrDashedStrokePlacement = errors.New("rasterx: inside/outside stroke cannot be combined with dashes")
 )
 
 type (
@@ -45,10 +78,30 @@ type (
 
 		firstP, trailPoint, leadPoint C2Point         // Tracks progress of the stroke
 		ln                            fixed.Point26_6 // last normal of intra-seg connection.
-		u, mLimit                     fixed.Int26_6   // u is the half-width of the stroke.
+		u                             fixed.Int26_6   // u is the half-width of the stroke.
 
 		JoinMode JoinMode
 		inStroke bool
+
+		// strokeMode selects center, inside or outside placement of the
+		// stroke band for closed contours. It defaults to StrokeCenter.
+		strokeMode StrokeMode
+		// width is the full stroke width requested through SetStroke.
+		width fixed.Int26_6
+		// mLimitScale is the miter limit in units of stroke widths, kept so
+		// the effective miter distance can follow the per-side offset.
+		mLimitScale fixed.Int26_6
+		// uPort and uStar are the actual offset distances on the port (left)
+		// and starboard (right) sides of the path. Both equal u in centered
+		// mode; for inside/outside strokes one side is the full width and the
+		// other side is zero.
+		uPort, uStar fixed.Int26_6
+		// buf accumulates the path while an inside/outside placement is
+		// active, since the interior side can only be found once the whole
+		// closed subpath is known. replaying indicates the buffered path is
+		// being fed back through the stroker and must not be buffered again.
+		buf       Path
+		replaying bool
 	}
 )
 
@@ -75,7 +128,6 @@ func NewStroker(width, height int, scanner Scanner) *Stroker {
 	//Defaults for stroking
 	r.SetWinding(true)
 	r.u = 2 << 6
-	r.mLimit = 4 << 6
 	r.JoinMode = MiterClip
 	r.JoinGap = RoundGap
 	r.CapL = RoundCap
@@ -89,13 +141,21 @@ func NewStroker(width, height int, scanner Scanner) *Stroker {
 // line ends. If one is nil, the other function is used at both ends. If both are nil, both ends are ButtCapped.
 // gp is the gap function that determines how a gap on the convex side of two joining lines is filled. jm is the JoinMode
 // for curve segments.
+//
+// A negative width returns an error via panic; a zero width produces no
+// visible stroke. The stroke placement (center/inside/outside) is controlled
+// separately through SetStrokeMode and is not changed here.
 func (r *Stroker) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc, gp GapFunc, jm JoinMode) {
+	if width < 0 {
+		panic(ErrNegativeWidth)
+	}
+	r.width = width
 	r.u = width / 2
+	r.mLimitScale = miterLimit
 	r.CapL = capL
 	r.CapT = capT
 	r.JoinMode = jm
 	r.JoinGap = gp
-	r.mLimit = (r.u * miterLimit) >> 6
 
 	if r.CapT == nil {
 		if r.CapL == nil {
@@ -114,7 +174,55 @@ func (r *Stroker) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc,
 			r.JoinGap = FlatGap
 		}
 	}
+	r.applySideOffsets()
+}
 
+// ErrNegativeWidth is returned (as a panic value) when SetStroke is called
+// with a negative stroke width.
+var ErrNegativeWidth = errors.New("rasterx: stroke width must not be negative")
+
+// SetStrokeMode selects how the stroke band is placed relative to a closed
+// contour. StrokeCenter (the default) keeps the path centered in the band and
+// never buffers the path. StrokeInside and StrokeOutside only apply to closed,
+// simple (non-self-intersecting) contours; see the StrokeMode constants and the
+// package level error values for the exact rules. The mode takes effect on the
+// next path; changing it while a path is being built does not affect that path.
+func (r *Stroker) SetStrokeMode(mode StrokeMode) {
+	r.strokeMode = mode
+	r.applySideOffsets()
+}
+
+// StrokeMode returns the current stroke placement mode.
+func (r *Stroker) StrokeMode() StrokeMode { return r.strokeMode }
+
+// applySideOffsets sets the per-side offset distances from the mode. For
+// centered stroking both sides carry half the width, which reproduces the
+// original stroker exactly. Inside/outside offsets are finalized against the
+// signed area of each closed subpath in flushBuffered.
+func (r *Stroker) applySideOffsets() {
+	switch r.strokeMode {
+	case StrokeCenter:
+		r.uPort, r.uStar = r.u, r.u
+	default:
+		// Interior/exterior side is unknown until the contour closes; the
+		// values are overwritten in flushBuffered.
+		r.uPort, r.uStar = r.u, r.u
+	}
+}
+
+// sideScaled returns the normal n (which always carries the centered half
+// width r.u in its length) rescaled to the offset distance d of the edge it
+// belongs to. d == 0 yields the zero vector, collapsing that edge onto the
+// source contour. When d equals r.u the input is returned unchanged, so the
+// centered mode output is bit identical to the original implementation.
+func sideScaled(n fixed.Point26_6, u, d fixed.Int26_6) fixed.Point26_6 {
+	if d == 0 || u == 0 {
+		return fixed.Point26_6{}
+	}
+	if d == u {
+		return n
+	}
+	return fixed.Point26_6{X: n.X * d / u, Y: n.Y * d / u}
 }
 
 // GapToCap is a utility that converts a CapFunc to GapFunc
@@ -230,17 +338,29 @@ func strokeArc(p Adder, a, s1, s2 fixed.Point26_6, clockwise bool, trimStart,
 // so that if can be wrapped to generate callbacks for the join points.
 func (r *Stroker) Joiner(p C2Point) {
 	crossProd := p.LNorm.X*p.TNorm.Y - p.TNorm.X*p.LNorm.Y
-	// stroke bottom edge, with the reverse of p
-	r.strokeEdge(C2Point{P: p.P, TNorm: Invert(p.LNorm), LNorm: Invert(p.TNorm),
-		TTan: Invert(p.LTan), LTan: Invert(p.TTan), RT: -p.RL, RL: -p.RT}, -crossProd)
-	// stroke top edge
-	r.strokeEdge(p, crossProd)
+	// Scale the centered normals (length r.u) to the actual offset of each
+	// side. In centered mode these are no-ops and the output is unchanged.
+	tNormS, lNormS := sideScaled(p.TNorm, r.u, r.uStar), sideScaled(p.LNorm, r.u, r.uStar)
+	tNormP, lNormP := sideScaled(p.TNorm, r.u, r.uPort), sideScaled(p.LNorm, r.u, r.uPort)
+	// stroke bottom (port) edge, with the reverse of p
+	r.strokeEdge(C2Point{P: p.P, TNorm: Invert(lNormP), LNorm: Invert(tNormP),
+		TTan: Invert(p.LTan), LTan: Invert(p.TTan), RT: -p.RL, RL: -p.RT}, -crossProd, r.uPort)
+	// stroke top (starboard) edge
+	r.strokeEdge(C2Point{P: p.P, TNorm: tNormS, LNorm: lNormS,
+		TTan: p.TTan, LTan: p.LTan, RT: p.RT, RL: p.RL}, crossProd, r.uStar)
 }
 
 // strokeEdge reduces code redundancy in the Joiner function by 2x since it handles
 // the top and bottom edges. This function encodes most of the logic of how to
 // handle joins between the given C2Point point p, and the end of the line.
-func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
+// d is the offset distance of this edge from the source contour; it is zero
+// for the source-aligned edge of an inside/outside stroke.
+func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6, d fixed.Int26_6) {
+	if d == 0 {
+		// This edge coincides with the source contour; the chain of Start/Line
+		// calls emitted elsewhere already traces it. Nothing joins or gaps.
+		return
+	}
 	ra := &r.Filler
 	s1, s2 := p.P.Add(p.TNorm), p.P.Add(p.LNorm) // Bevel points for top leading and trailing
 	ra.Start(s1)
@@ -255,14 +375,14 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 	// Adjust radiuses for stroke width
 	if r.JoinMode == Arc || r.JoinMode == ArcClip {
 		// Find centers of radius of curvature and adjust the radius to be drawn
-		// by half the stroke width.
+		// by this edge's offset distance.
 		if p.RT != 0 {
 			if p.RT > 0 {
 				ct = p.P.Add(ToLength(turnPort90(p.TTan), p.RT))
-				rt = p.RT - r.u
+				rt = p.RT - d
 			} else {
 				ct = p.P.Sub(ToLength(turnPort90(p.TTan), -p.RT))
-				rt = -p.RT + r.u
+				rt = -p.RT + d
 			}
 			if rt < 0 {
 				rt = 0
@@ -271,10 +391,10 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 		if p.RL != 0 {
 			if p.RL > 0 {
 				cl = p.P.Add(ToLength(turnPort90(p.LTan), p.RL))
-				rl = p.RL - r.u
+				rl = p.RL - d
 			} else {
 				cl = p.P.Sub(ToLength(turnPort90(p.LTan), -p.RL))
-				rl = -p.RL + r.u
+				rl = -p.RL + d
 			}
 			if rl < 0 {
 				rl = 0
@@ -282,13 +402,15 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 		}
 	}
 
+	// mLimit is the miter cutoff on this edge, scaled to its offset distance.
+	mLimitEdge := (d * r.mLimitScale) >> 6
 	if r.JoinMode == MiterClip || r.JoinMode == Miter ||
 		// Arc or ArcClip with 0 tRadCurve and 0 lRadCurve is treated the same as a
 		// Miter or MiterClip join, resp.
 		((r.JoinMode == Arc || r.JoinMode == ArcClip) && (rt == 0 && rl == 0)) {
 		xt := CalcIntersect(s1.Sub(p.TTan), s1, s2, s2.Sub(p.LTan))
 		xa := xt.Sub(p.P)
-		if Length(xa) < r.mLimit { // within miter limit
+		if Length(xa) < mLimitEdge { // within miter limit
 			ra.Line(xt)
 			ra.Line(s2)
 			return
@@ -297,12 +419,12 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 			//Projection of tNorm onto xa
 			tProjP := xa.Mul(fixed.Int26_6((DotProd(xa, p.TNorm) << 6) / DotProd(xa, xa)))
 			projLen := Length(tProjP)
-			if r.mLimit > projLen { // the miter limit line is past the bevel point
+			if mLimitEdge > projLen { // the miter limit line is past the bevel point
 				// t is the fraction shifted by tStrokeShift to scale the vectors from the bevel point
 				// to the line intersection, so that they abbut the miter limit line.
 				tiLength := Length(xa)
 				sx1, sx2 := xt.Sub(s1), xt.Sub(s2)
-				t := (r.mLimit - projLen) << tStrokeShift / (tiLength - projLen)
+				t := (mLimitEdge - projLen) << tStrokeShift / (tiLength - projLen)
 				tx := ToLength(sx1, t*Length(sx1)>>tStrokeShift)
 				lx := ToLength(sx2, t*Length(sx2)>>tStrokeShift)
 				vx := ToLength(xa, t*Length(xa)>>tStrokeShift)
@@ -323,7 +445,7 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 			if intersect {
 				ray1, ray2 := xt.Sub(cl), s2.Sub(cl)
 				clockwise := (ray1.X*ray2.Y > ray1.Y*ray2.X) // Sign of xprod
-				if Length(p.P.Sub(xt)) < r.mLimit {          // within miter limit
+				if Length(p.P.Sub(xt)) < mLimitEdge {        // within miter limit
 					strokeArc(ra, cl, xt, s2, clockwise, 0, 0, ra.Line)
 					ra.Line(s2)
 					return
@@ -334,11 +456,11 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 					//Projection of tNorm onto xa
 					tProjP := xa.Mul(fixed.Int26_6((DotProd(xa, p.TNorm) << 6) / DotProd(xa, xa)))
 					projLen := Length(tProjP)
-					if r.mLimit > projLen { // the miter limit line is past the bevel point
+					if mLimitEdge > projLen { // the miter limit line is past the bevel point
 						// t is the fraction shifted by tStrokeShift to scale the line or arc from the bevel point
 						// to the line intersection, so that they abbut the miter limit line.
 						sx1 := xt.Sub(s1) //, xt.Sub(s2)
-						t := fixed.Int26_6(1<<tStrokeShift) - ((r.mLimit - projLen) << tStrokeShift / (Length(xa) - projLen))
+						t := fixed.Int26_6(1<<tStrokeShift) - ((mLimitEdge - projLen) << tStrokeShift / (Length(xa) - projLen))
 						tx := ToLength(sx1, t*Length(sx1)>>tStrokeShift)
 						s1p := xt.Sub(tx)
 						ra.Line(s1p)
@@ -368,7 +490,7 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 			if intersect {
 				ray1, ray2 := s1.Sub(ct), xt.Sub(ct)
 				clockwise := ray1.X*ray2.Y > ray1.Y*ray2.X
-				if Length(p.P.Sub(xt)) < r.mLimit { // within miter limit
+				if Length(p.P.Sub(xt)) < mLimitEdge { // within miter limit
 					strokeArc(ra, ct, s1, xt, clockwise, 0, 0, ra.Line)
 					ra.Line(s2)
 					return
@@ -379,11 +501,11 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 					//Projection of lNorm onto xa
 					lProjP := xa.Mul(fixed.Int26_6((DotProd(xa, p.LNorm) << 6) / DotProd(xa, xa)))
 					projLen := Length(lProjP)
-					if r.mLimit > projLen { // The miter limit line is past the bevel point,
+					if mLimitEdge > projLen { // The miter limit line is past the bevel point,
 						// t is the fraction to scale the line or arc from the bevel point
 						// to the line intersection, so that they abbut the miter limit line.
 						sx2 := xt.Sub(s2)
-						t := fixed.Int26_6(1<<tStrokeShift) - ((r.mLimit - projLen) << tStrokeShift / (Length(xa) - projLen))
+						t := fixed.Int26_6(1<<tStrokeShift) - ((mLimitEdge - projLen) << tStrokeShift / (Length(xa) - projLen))
 						lx := ToLength(sx2, t*Length(sx2)>>tStrokeShift)
 						s2p := xt.Sub(lx)
 						_, _, ps2, ds2 := strokeArc(ra, ct, s1, xt, clockwise, 0, t, ra.Line)
@@ -413,7 +535,7 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 				ray1, ray2 = xt.Sub(cl), s2.Sub(cl)
 				clockwiseL := ray1.X*ray2.Y > ray1.Y*ray2.X
 
-				if Length(p.P.Sub(xt)) < r.mLimit { // within miter limit
+				if Length(p.P.Sub(xt)) < mLimitEdge { // within miter limit
 					strokeArc(ra, ct, s1, xt, clockwiseT, 0, 0, ra.Line)
 					strokeArc(ra, cl, xt, s2, clockwiseL, 0, 0, ra.Line)
 					ra.Line(s2)
@@ -425,10 +547,10 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 					//Projection of lNorm onto xa
 					lProjP := xa.Mul(fixed.Int26_6((DotProd(xa, p.LNorm) << 6) / DotProd(xa, xa)))
 					projLen := Length(lProjP)
-					if r.mLimit > projLen { // The miter limit line is past the bevel point,
+					if mLimitEdge > projLen { // The miter limit line is past the bevel point,
 						// t is the fraction to scale the line or arc from the bevel point
 						// to the line intersection, so that they abbut the miter limit line.
-						t := fixed.Int26_6(1<<tStrokeShift) - ((r.mLimit - projLen) << tStrokeShift / (Length(xa) - projLen))
+						t := fixed.Int26_6(1<<tStrokeShift) - ((mLimitEdge - projLen) << tStrokeShift / (Length(xa) - projLen))
 						_, _, ps1, ds1 := strokeArc(ra, ct, s1, xt, clockwiseT, 0, t, r.Filler.Line)
 						ps2, ds2, fs2, _ := strokeArc(ra, cl, xt, s2, clockwiseL, t, 0, ra.Start)
 						midP := ps1.Add(ps2).Mul(fixed.Int26_6(1 << 5)) // midpoint
@@ -463,7 +585,27 @@ func (r *Stroker) strokeEdge(p C2Point, crossProd fixed.Int26_6) {
 // Stop a stroked line. The line will close
 // is isClosed is true. Otherwise end caps will
 // be drawn at both ends.
+//
+// When an inside or outside placement is active, the path has been buffered;
+// it is validated and replayed here against the side offsets derived from the
+// signed area of each closed subpath.
 func (r *Stroker) Stop(isClosed bool) {
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		if len(r.buf) == 0 {
+			// Trailing Stop(false) emitted by Path.AddTo after the buffer
+			// has already been flushed, or an empty path: nothing to do.
+			return
+		}
+		r.buf.Stop(isClosed)
+		if !isClosed {
+			// Inside/outside strokes are undefined for open contours: there is
+			// no interior side to attach the band to.
+			r.buf = r.buf[:0]
+			panic(ErrOpenPathStroke)
+		}
+		r.flushBuffered()
+		return
+	}
 	if r.inStroke == false {
 		return
 	}
@@ -477,18 +619,28 @@ func (r *Stroker) Stop(isClosed bool) {
 		r.firstP.RT = r.leadPoint.RT
 		r.firstP.TTan = r.leadPoint.TTan
 
-		rf.Start(r.firstP.P.Sub(r.firstP.TNorm))
-		rf.Line(a.Sub(r.ln))
-		rf.Start(a.Add(r.ln))
-		rf.Line(r.firstP.P.Add(r.firstP.TNorm))
+		portFirst := sideScaled(r.firstP.TNorm, r.u, r.uPort)
+		starFirst := sideScaled(r.firstP.TNorm, r.u, r.uStar)
+		portLast := sideScaled(r.ln, r.u, r.uPort)
+		starLast := sideScaled(r.ln, r.u, r.uStar)
+		rf.Start(r.firstP.P.Sub(portFirst))
+		rf.Line(a.Sub(portLast))
+		rf.Start(a.Add(starLast))
+		rf.Line(r.firstP.P.Add(starFirst))
 		r.Joiner(r.firstP)
-		r.firstP.blackWidowMark(rf)
+		r.blackWidowMark(rf, r.firstP)
 	} else {
 		a := rf.a
-		rf.Start(r.leadPoint.P.Sub(r.leadPoint.TNorm))
-		rf.Line(a.Sub(r.ln))
-		rf.Start(a.Add(r.ln))
-		rf.Line(r.leadPoint.P.Add(r.leadPoint.TNorm))
+		portLead := sideScaled(r.leadPoint.TNorm, r.u, r.uPort)
+		starLead := sideScaled(r.leadPoint.TNorm, r.u, r.uStar)
+		portLast := sideScaled(r.ln, r.u, r.uPort)
+		starLast := sideScaled(r.ln, r.u, r.uStar)
+		rf.Start(r.leadPoint.P.Sub(portLead))
+		rf.Line(a.Sub(portLast))
+		rf.Start(a.Add(starLast))
+		rf.Line(r.leadPoint.P.Add(starLead))
+		// Open paths always use centered placement (inside/outside is rejected
+		// up front), so the caps span the full centered width as before.
 		r.CapL(rf, r.leadPoint.P, r.leadPoint.TNorm)
 		r.CapT(rf, r.firstP.P, Invert(r.firstP.LNorm))
 	}
@@ -497,11 +649,19 @@ func (r *Stroker) Stop(isClosed bool) {
 
 // QuadBezier starts a stroked quadratic bezier.
 func (r *Stroker) QuadBezier(b, c fixed.Point26_6) {
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		r.buf.QuadBezier(b, c)
+		return
+	}
 	r.quadBezierf(r, b, c)
 }
 
 // CubeBezier starts a stroked quadratic bezier.
 func (r *Stroker) CubeBezier(b, c, d fixed.Point26_6) {
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		r.buf.CubeBezier(b, c, d)
+		return
+	}
 	r.cubeBezierf(r, b, c, d)
 }
 
@@ -553,11 +713,21 @@ func (r *Stroker) cubeBezierf(sgm Rasterx, b, c, d fixed.Point26_6) {
 
 // Line adds a line segment to the rasterizer
 func (r *Stroker) Line(b fixed.Point26_6) {
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		r.buf.Line(b)
+		return
+	}
 	r.LineSeg(r, b)
 }
 
-//LineSeg is called by both the Stroker and Dasher
+// LineSeg is called by both the Stroker and Dasher
 func (r *Stroker) LineSeg(sgm Rasterx, b fixed.Point26_6) {
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		// Dasher routes its segments here; keep buffering consistent so a
+		// Dasher with an active dash pattern is caught explicitly below.
+		r.buf.Line(b)
+		return
+	}
 	r.trailPoint = r.leadPoint
 	ba := b.Sub(r.a)
 	if ba.X == 0 && ba.Y == 0 { // a == b, line is degenerate
@@ -596,18 +766,36 @@ func (r *Stroker) lineF(b fixed.Point26_6) {
 		bnorm = turnPort90(ToLength(b.Sub(a), r.u)) // Intra segment normal
 	}
 	ra := &r.Filler
-	ra.Start(b.Sub(bnorm))
-	ra.Line(a.Sub(r.ln))
-	ra.Start(a.Add(r.ln))
-	ra.Line(b.Add(bnorm))
+	// Rescale the centered normal (length r.u) to the per-side offsets.
+	portB, starB := sideScaled(bnorm, r.u, r.uPort), sideScaled(bnorm, r.u, r.uStar)
+	portLn, starLn := sideScaled(r.ln, r.u, r.uPort), sideScaled(r.ln, r.u, r.uStar)
+	ra.Start(b.Sub(portB))
+	ra.Line(a.Sub(portLn))
+	ra.Start(a.Add(starLn))
+	ra.Line(b.Add(starB))
 	r.a = b
 	r.ln = bnorm
 }
 
 // Start iniitates a stroked path
 func (r *Stroker) Start(a fixed.Point26_6) {
+	if r.strokeMode != StrokeCenter && !r.replaying {
+		// Buffer the path; the interior side of a closed contour can only be
+		// determined from its signed area once the contour is complete.
+		r.buf.Start(a)
+		return
+	}
 	r.inStroke = false
 	r.Filler.Start(a)
+}
+
+// Clear resets the stroker and discards any buffered path. The stroke mode and
+// stroke parameters are retained.
+func (r *Stroker) Clear() {
+	r.buf = r.buf[:0]
+	r.replaying = false
+	r.inStroke = false
+	r.Filler.Clear()
 }
 
 // CalcEndCurvature calculates the radius of curvature given the control points
@@ -637,17 +825,21 @@ func (r *Stroker) joinF() {
 		r.firstP = r.trailPoint
 	} else {
 		ra := &r.Filler
-		tl := r.trailPoint.P.Sub(r.trailPoint.TNorm)
-		th := r.trailPoint.P.Add(r.trailPoint.TNorm)
+		portT := sideScaled(r.trailPoint.TNorm, r.u, r.uPort)
+		starT := sideScaled(r.trailPoint.TNorm, r.u, r.uStar)
+		tl := r.trailPoint.P.Sub(portT)
+		th := r.trailPoint.P.Add(starT)
 		if r.a != r.trailPoint.P || r.ln != r.trailPoint.TNorm {
 			a := r.a
+			portLn := sideScaled(r.ln, r.u, r.uPort)
+			starLn := sideScaled(r.ln, r.u, r.uStar)
 			ra.Start(tl)
-			ra.Line(a.Sub(r.ln))
-			ra.Start(a.Add(r.ln))
+			ra.Line(a.Sub(portLn))
+			ra.Start(a.Add(starLn))
 			ra.Line(th)
 		}
 		r.Joiner(r.trailPoint)
-		r.trailPoint.blackWidowMark(ra)
+		r.blackWidowMark(ra, r.trailPoint)
 	}
 	r.ln = r.trailPoint.LNorm
 	r.a = r.trailPoint.P
@@ -656,19 +848,24 @@ func (r *Stroker) joinF() {
 // blackWidowMark handles a gap in a stroke that can occur when a line end is too close
 // to a segment to segment join point. Although it is only required in those cases,
 // at this point, no code has been written to properly detect when it is needed,
-// so for now it just draws by default.
-func (jp *C2Point) blackWidowMark(ra Adder) {
+// so for now it just draws by default. The centered normals of the C2Point are
+// rescaled to the stroker's per-side offsets before use.
+func (r *Stroker) blackWidowMark(ra Adder, jp C2Point) {
+	portT := sideScaled(jp.TNorm, r.u, r.uPort)
+	portL := sideScaled(jp.LNorm, r.u, r.uPort)
+	starT := sideScaled(jp.TNorm, r.u, r.uStar)
+	starL := sideScaled(jp.LNorm, r.u, r.uStar)
 	xprod := jp.TNorm.X*jp.LNorm.Y - jp.TNorm.Y*jp.LNorm.X
 	if xprod > epsilonFixed*epsilonFixed {
-		tl := jp.P.Sub(jp.TNorm)
-		ll := jp.P.Sub(jp.LNorm)
+		tl := jp.P.Sub(portT)
+		ll := jp.P.Sub(portL)
 		ra.Start(jp.P)
 		ra.Line(tl)
 		ra.Line(ll)
 		ra.Line(jp.P)
 	} else if xprod < -epsilonFixed*epsilonFixed {
-		th := jp.P.Add(jp.TNorm)
-		lh := jp.P.Add(jp.LNorm)
+		th := jp.P.Add(starT)
+		lh := jp.P.Add(starL)
 		ra.Start(jp.P)
 		ra.Line(lh)
 		ra.Line(th)

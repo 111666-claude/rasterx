@@ -9,6 +9,40 @@ Rasterx is a golang rasterizer that implements path stroking functions capable o
 * Not specified in the SVG2.0 spec., but supported in rasterx is the arc-clip join, which is the arc join analog of a miter-clip join, both of which end the miter at a specified distance, rather than all or nothing.
 * Several cap and gap functions in addition to those specified by SVG2.0 are implemented, specifically quad and cubic caps and gaps.
 * Line start and end capping functions can be different.
+* Closed, simple contours can be stroked centered (the default), fully inside or fully outside the path via `Stroker.SetStrokeMode`, so an icon border can grow outward while its filled interior keeps its original size.
+
+## Inside, centered and outside stroke placement
+
+`SetStrokeMode(StrokeCenter | StrokeInside | StrokeOutside)` selects where the
+stroke band of width `w` sits relative to a closed, non-self-intersecting
+contour:
+
+| Mode            | Port side offset | Starboard side offset | Result |
+|-----------------|------------------|-----------------------|--------|
+| `StrokeCenter`  | `w/2`            | `w/2`                 | Original SVG behavior; unchanged default. |
+| `StrokeInside`  | `w` on the interior side, `0` on the other | | The exterior boundary keeps the contour's original size. |
+| `StrokeOutside` | `w` on the exterior side, `0` on the other | | The interior boundary keeps the contour's original size, so the fill region is never overpainted. |
+
+The interior side is determined per closed subpath from its signed area, so
+clockwise and counter-clockwise traversals of the same contour produce
+equivalent strokes; holes (oppositely oriented subpaths) are handled
+individually. Lines and flattened Bezier segments share the same offsets, and
+join mode, cap/gap functions and the miter limit (scaled with the active side
+offset) behave as in centered stroking.
+
+Placement rules:
+
+* Inside/outside modes require **closed** subpaths; an open subpath panics with
+  `ErrOpenPathStroke`. Open paths keep using centered stroking with end caps.
+* A closed contour with (near) zero signed area panics with
+  `ErrZeroAreaStroke`, since it has no determinable interior.
+* A negative stroke width panics with `ErrNegativeWidth`; a zero width renders
+  nothing.
+* Inside/outside placement cannot be combined with dash patterns and panics
+  with `ErrDashedStrokePlacement`; use `StrokeCenter` for dashed strokes.
+* A stroke wider than the contour itself (for example a very narrow inside
+  stroke) is still rendered; offset edges simply collapse onto the source
+  contour where the geometry requires it.
 
 
 ![rasterx example](/doc/TestShapes4.svg.png?raw=true "Rasterx Example")
