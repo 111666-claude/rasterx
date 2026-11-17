@@ -16,7 +16,17 @@ type Dasher struct {
 	dashPlace                 int
 	firstDashIsGap, dashIsGap bool
 	deltaDash, DashOffset     fixed.Int26_6
-	sgm                       Rasterx
+	// ContinueDashPhase selects cross-subpath dash phase continuity.
+	// When false (the default) every Start restarts the dash pattern at
+	// DashOffset, which is the historical behavior. When true, a Start
+	// that follows a previously stroked subpath resumes the dash pattern
+	// at the phase where that subpath ended, so dashes stay continuous
+	// across the seams of a path drawn as several subpaths. The phase
+	// still restarts at DashOffset for the first subpath after SetStroke,
+	// and after any call to ResetDashPhase.
+	ContinueDashPhase bool
+	dashPhaseSet      bool
+	sgm               Rasterx
 	// sgm allows us to switch between dashing
 	// and non-dashing rasterizers in the SetStroke function.
 }
@@ -31,22 +41,60 @@ func (r *Dasher) joinF() {
 
 // Start starts a dashed line
 func (r *Dasher) Start(a fixed.Point26_6) {
-	// Advance dashPlace to the dashOffset start point and set deltaDash
 	if len(r.Dashes) > 0 {
-		r.deltaDash = r.DashOffset
-		r.dashIsGap = false
-		r.dashPlace = 0
-		for r.deltaDash > r.Dashes[r.dashPlace] {
-			r.deltaDash -= r.Dashes[r.dashPlace]
-			r.dashIsGap = !r.dashIsGap
-			r.dashPlace++
-			if r.dashPlace == len(r.Dashes) {
-				r.dashPlace = 0
+		if r.ContinueDashPhase && r.dashPhaseSet {
+			// Resume the phase consumed by the previous subpath.
+			r.normalizeDashPhase()
+		} else {
+			// Advance dashPlace to the dashOffset start point and set deltaDash
+			r.deltaDash = r.DashOffset
+			r.dashIsGap = false
+			r.dashPlace = 0
+			for r.deltaDash > r.Dashes[r.dashPlace] {
+				r.deltaDash -= r.Dashes[r.dashPlace]
+				r.dashIsGap = !r.dashIsGap
+				r.dashPlace++
+				if r.dashPlace == len(r.Dashes) {
+					r.dashPlace = 0
+				}
 			}
+			r.dashPhaseSet = true
 		}
 		r.firstDashIsGap = r.dashIsGap
 	}
 	r.Stroker.Start(a)
+}
+
+// normalizeDashPhase advances the dash phase past any completely consumed
+// dash elements. A subpath can end with deltaDash exactly equal to the
+// length of the current dash element (or positioned on zero length
+// elements); without normalization the next subpath would emit a zero
+// length dash bit and an extra cap at the seam. SetStroke guarantees at
+// least one positive element, so the loop always terminates.
+func (r *Dasher) normalizeDashPhase() {
+	for r.deltaDash >= r.Dashes[r.dashPlace] {
+		r.deltaDash -= r.Dashes[r.dashPlace]
+		r.dashIsGap = !r.dashIsGap
+		r.dashPlace++
+		if r.dashPlace == len(r.Dashes) {
+			r.dashPlace = 0
+		}
+	}
+}
+
+// ResetDashPhase forces the next Start to begin the dash pattern at
+// DashOffset again, even when ContinueDashPhase is set. Use it when
+// beginning a new, logically independent polyline.
+func (r *Dasher) ResetDashPhase() {
+	r.dashPhaseSet = false
+}
+
+// DashPhase returns the current dash pattern phase: the index of the
+// current element of Dashes, the length already consumed within that
+// element, and whether that element is a gap. It is primarily useful for
+// verifying phase continuity across subpaths.
+func (r *Dasher) DashPhase() (place int, consumed fixed.Int26_6, isGap bool) {
+	return r.dashPlace, r.deltaDash, r.dashIsGap
 }
 
 // lineF overides stroker lineF to modify the the call as below
@@ -83,10 +131,20 @@ func (r *Dasher) lineF(b fixed.Point26_6) {
 // line ends. If one is nil, the other function is used at both ends. gp is the gap function that determines how a
 // gap on the convex side of two lines joining is filled. jm is the JoinMode for curve segments. Dashes is the values for
 // the dash pattern. Pass in nil or an empty slice for no dashes. dashoffset is the starting offset into the dash array.
+//
+// Dash pattern semantics: non-positive dash lengths are treated as zero, and
+// if no element is positive the stroke is drawn solid. An odd number of dash
+// elements is cycled through with the dash/gap role toggling on each wrap,
+// which is equivalent to the SVG rule of concatenating the array with itself.
+// A negative dashOffset is applied as-is, which deterministically lengthens
+// the first dash element by the offset's magnitude. SetStroke also resets any
+// dash phase accumulated under ContinueDashPhase, so the next Start begins at
+// dashOffset.
 func (r *Dasher) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc, gp GapFunc, jm JoinMode, dashes []float64, dashOffset float64) {
 	r.Stroker.SetStroke(width, miterLimit, capL, capT, gp, jm)
 
 	r.Dashes = r.Dashes[:0] // clear the dash array
+	r.dashPhaseSet = false  // restart the dash phase at DashOffset on the next Start
 	if len(dashes) == 0 {
 		r.sgm = &r.Stroker // This is just plain stroking
 		return
@@ -112,7 +170,7 @@ func (r *Dasher) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc, 
 	r.sgm = r // Use the full dasher
 }
 
-//Stop terminates a dashed line
+// Stop terminates a dashed line
 func (r *Dasher) Stop(isClosed bool) {
 	if len(r.Dashes) == 0 {
 		r.Stroker.Stop(isClosed)
