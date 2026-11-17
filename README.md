@@ -9,6 +9,7 @@ Rasterx is a golang rasterizer that implements path stroking functions capable o
 * Not specified in the SVG2.0 spec., but supported in rasterx is the arc-clip join, which is the arc join analog of a miter-clip join, both of which end the miter at a specified distance, rather than all or nothing.
 * Several cap and gap functions in addition to those specified by SVG2.0 are implemented, specifically quad and cubic caps and gaps.
 * Line start and end capping functions can be different.
+* Non-scaling strokes (the SVG `vector-effect="non-scaling-stroke"` behavior) are supported: enable `Stroker.SetNonScaling(true, m)` (also available on the `Dasher`) and the path geometry is transformed by matrix `m` into device space before stroking, so the stroke width, caps, joins and dash lengths stay constant on screen under any affine transform, including non-uniform scaling, rotation and shearing.
 
 
 ![rasterx example](/doc/TestShapes4.svg.png?raw=true "Rasterx Example")

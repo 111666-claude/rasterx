@@ -42,6 +42,11 @@ type (
 		Source                 image.Image
 		Offset                 image.Point
 		minX, minY, maxX, maxY fixed.Int26_6 // keep track of bounds
+		// pen tracks the current pen position so zero-length segments can
+		// be dropped; the underlying vector rasterizer divides by the
+		// segment delta and panics on a degenerate (zero-length) segment.
+		pen    fixed.Point26_6
+		penSet bool
 	}
 )
 
@@ -124,13 +129,31 @@ func (s *ScannerGV) set(a fixed.Point26_6) {
 // Start starts a new path at the given point.
 func (s *ScannerGV) Start(a fixed.Point26_6) {
 	s.set(a)
+	s.pen = a
+	s.penSet = true
 	s.r.MoveTo(float32(a.X)/64, float32(a.Y)/64)
 }
 
 // Line adds a linear segment to the current curve.
 func (s *ScannerGV) Line(b fixed.Point26_6) {
 	s.set(b)
-	s.r.LineTo(float32(b.X)/64, float32(b.Y)/64)
+	// Drop zero-length segments: they carry no coverage, and the underlying
+	// vector rasterizer divides by the segment delta and would panic on a
+	// degenerate segment. The comparison is done on the float32 values the
+	// rasterizer actually receives, because at extreme magnitudes distinct
+	// fixed-point coordinates can round to the same float32 (float32 has only
+	// 24 mantissa bits). Such segments arise from saturated extreme
+	// coordinates or singular transformations in non-scaling stroke mode.
+	fx, fy := float32(b.X)/64, float32(b.Y)/64
+	if s.penSet {
+		px, py := float32(s.pen.X)/64, float32(s.pen.Y)/64
+		if fx == px && fy == py {
+			return
+		}
+	}
+	s.pen = b
+	s.penSet = true
+	s.r.LineTo(fx, fy)
 }
 
 // Draw renders the accumulate scan to the desination
@@ -158,6 +181,7 @@ func (s *ScannerGV) Clear() {
 	s.r.Reset(p.X, p.Y)
 	const mxfi = fixed.Int26_6(math.MaxInt32)
 	s.minX, s.minY, s.maxX, s.maxY = mxfi, mxfi, -mxfi, -mxfi
+	s.penSet = false
 }
 
 // SetBounds sets the maximum width and height of the rasterized image and

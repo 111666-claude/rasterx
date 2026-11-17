@@ -31,6 +31,9 @@ func (r *Dasher) joinF() {
 
 // Start starts a dashed line
 func (r *Dasher) Start(a fixed.Point26_6) {
+	// The embedded Stroker.Start applies the non-scaling mapping itself,
+	// so the dash bookkeeping below works on the original user-space point
+	// while the stroker receives the mapped point.
 	// Advance dashPlace to the dashOffset start point and set deltaDash
 	if len(r.Dashes) > 0 {
 		r.deltaDash = r.DashOffset
@@ -112,7 +115,7 @@ func (r *Dasher) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc, 
 	r.sgm = r // Use the full dasher
 }
 
-//Stop terminates a dashed line
+// Stop terminates a dashed line
 func (r *Dasher) Stop(isClosed bool) {
 	if len(r.Dashes) == 0 {
 		r.Stroker.Stop(isClosed)
@@ -172,11 +175,13 @@ func (r *Dasher) dashLineStrokeBit(b, bnorm fixed.Point26_6, dontClose bool) {
 
 // Line for Dasher is here to pass the dasher sgm to LineP
 func (r *Dasher) Line(b fixed.Point26_6) {
+	b = r.mapStrokePoint(b)
 	r.LineSeg(r.sgm, b)
 }
 
 // QuadBezier for dashing
 func (r *Dasher) QuadBezier(b, c fixed.Point26_6) {
+	b, c = r.mapStrokePoint(b), r.mapStrokePoint(c)
 	r.quadBezierf(r.sgm, b, c)
 }
 
@@ -184,6 +189,7 @@ func (r *Dasher) QuadBezier(b, c fixed.Point26_6) {
 // It is a low level function exposed for the purposes of callbacks
 // and debugging.
 func (r *Dasher) CubeBezier(b, c, d fixed.Point26_6) {
+	b, c, d = r.mapStrokePoint(b), r.mapStrokePoint(c), r.mapStrokePoint(d)
 	r.cubeBezierf(r.sgm, b, c, d)
 }
 
@@ -196,6 +202,7 @@ func NewDasher(width, height int, scanner Scanner) *Dasher {
 	r.Scanner = scanner
 	r.SetBounds(width, height)
 	r.SetWinding(true)
+	r.Transformer = Identity
 	r.SetStroke(1*64, 4*64, ButtCap, nil, FlatGap, MiterClip, nil, 0)
 	r.sgm = &r.Stroker
 	return r

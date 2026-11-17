@@ -49,6 +49,18 @@ type (
 
 		JoinMode JoinMode
 		inStroke bool
+
+		// NonScaling switches on the non-scaling-stroke mode. When true,
+		// every path point is mapped through Transformer before stroking,
+		// so the stroke is built in device space and its width, caps,
+		// joins and dashes keep a constant size on screen under any
+		// affine transformation (including non-uniform scale, rotation
+		// and shear). When false (the default) stroking is unchanged.
+		NonScaling bool
+		// Transformer is the user-to-device affine matrix used in
+		// non-scaling mode. It is ignored unless NonScaling is true.
+		// It defaults to the identity matrix.
+		Transformer Matrix2D
 	}
 )
 
@@ -80,8 +92,21 @@ func NewStroker(width, height int, scanner Scanner) *Stroker {
 	r.JoinGap = RoundGap
 	r.CapL = RoundCap
 	r.CapT = RoundCap
+	r.Transformer = Identity
 	r.SetStroke(1<<6, 4<<6, ButtCap, nil, FlatGap, MiterClip)
 	return r
+}
+
+// SetNonScaling enables or disables the non-scaling-stroke mode and sets the
+// user-to-device transformation matrix used while it is enabled. In
+// non-scaling mode the path geometry is mapped through m into device space
+// and then stroked with a constant device-space width; caps, joins and dash
+// lengths are likewise interpreted in device space. Passing a singular
+// matrix is handled deterministically (directions collapse, undefined
+// components become zero) rather than panicking.
+func (r *Stroker) SetNonScaling(enable bool, m Matrix2D) {
+	r.NonScaling = enable
+	r.Transformer = m
 }
 
 // SetStroke set the parameters for stroking a line. width is the width of the line, miterlimit is the miter cutoff
@@ -90,6 +115,12 @@ func NewStroker(width, height int, scanner Scanner) *Stroker {
 // gp is the gap function that determines how a gap on the convex side of two joining lines is filled. jm is the JoinMode
 // for curve segments.
 func (r *Stroker) SetStroke(width, miterLimit fixed.Int26_6, capL, capT CapFunc, gp GapFunc, jm JoinMode) {
+	if width < 0 {
+		// A negative width has no SVG meaning; clamp it to zero so the
+		// stroke deterministically renders nothing instead of inverting
+		// every normal. A zero width likewise produces no coverage.
+		width = 0
+	}
 	r.u = width / 2
 	r.CapL = capL
 	r.CapT = capT
@@ -470,7 +501,11 @@ func (r *Stroker) Stop(isClosed bool) {
 	rf := &r.Filler
 	if isClosed {
 		if r.firstP.P != rf.a {
-			r.Line(r.firstP.P)
+			// Route through LineSeg instead of Line: when the Dasher
+			// overrides Line (or non-scaling mode maps points), calling
+			// Line here would transform the already device-space point a
+			// second time.
+			r.LineSeg(r, r.firstP.P)
 		}
 		a := rf.a
 		r.firstP.TNorm = r.leadPoint.TNorm
@@ -497,16 +532,32 @@ func (r *Stroker) Stop(isClosed bool) {
 
 // QuadBezier starts a stroked quadratic bezier.
 func (r *Stroker) QuadBezier(b, c fixed.Point26_6) {
+	b, c = r.mapStrokePoint(b), r.mapStrokePoint(c)
 	r.quadBezierf(r, b, c)
 }
 
-// CubeBezier starts a stroked quadratic bezier.
+// CubeBezier starts a stroked cubic bezier.
 func (r *Stroker) CubeBezier(b, c, d fixed.Point26_6) {
+	b, c, d = r.mapStrokePoint(b), r.mapStrokePoint(c), r.mapStrokePoint(d)
 	r.cubeBezierf(r, b, c, d)
 }
 
 // quadBezierf calcs end curvature of beziers
 func (r *Stroker) quadBezierf(s Rasterx, b, c fixed.Point26_6) {
+	// Handle the degenerate case directly: Filler.QuadBezierF would call
+	// sgm.Line(c), which on a Stroker/Dasher re-enters the public Line
+	// entry point and, in non-scaling mode, would map c a second time.
+	if r.a == b || b == c {
+		switch q := s.(type) {
+		case *Stroker:
+			q.LineSeg(q, c)
+		case *Dasher:
+			q.LineSeg(q.sgm, c)
+		default:
+			s.Line(c)
+		}
+		return
+	}
 	r.trailPoint = r.leadPoint
 	r.CalcEndCurvature(r.a, b, c, c, b, r.a, fixed.Int52_12(2<<12), doCalcCurvature(s))
 	r.QuadBezierF(s, b, c)
@@ -530,7 +581,17 @@ func doCalcCurvature(r Rasterx) bool {
 
 func (r *Stroker) cubeBezierf(sgm Rasterx, b, c, d fixed.Point26_6) {
 	if (r.a == b && c == d) || (r.a == b && b == c) || (c == b && d == c) {
-		sgm.Line(d)
+		// Degenerate curve: go straight through LineSeg instead of
+		// sgm.Line so the already device-space point d is not mapped
+		// again in non-scaling mode.
+		switch q := sgm.(type) {
+		case *Stroker:
+			q.LineSeg(q, d)
+		case *Dasher:
+			q.LineSeg(q.sgm, d)
+		default:
+			sgm.Line(d)
+		}
 		return
 	}
 	r.trailPoint = r.leadPoint
@@ -553,10 +614,11 @@ func (r *Stroker) cubeBezierf(sgm Rasterx, b, c, d fixed.Point26_6) {
 
 // Line adds a line segment to the rasterizer
 func (r *Stroker) Line(b fixed.Point26_6) {
+	b = r.mapStrokePoint(b)
 	r.LineSeg(r, b)
 }
 
-//LineSeg is called by both the Stroker and Dasher
+// LineSeg is called by both the Stroker and Dasher
 func (r *Stroker) LineSeg(sgm Rasterx, b fixed.Point26_6) {
 	r.trailPoint = r.leadPoint
 	ba := b.Sub(r.a)
@@ -607,7 +669,7 @@ func (r *Stroker) lineF(b fixed.Point26_6) {
 // Start iniitates a stroked path
 func (r *Stroker) Start(a fixed.Point26_6) {
 	r.inStroke = false
-	r.Filler.Start(a)
+	r.Filler.Start(r.mapStrokePoint(a))
 }
 
 // CalcEndCurvature calculates the radius of curvature given the control points
