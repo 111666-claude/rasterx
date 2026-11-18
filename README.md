@@ -17,7 +17,25 @@ The above image shows the effect of using different join modes for a stroked cur
 
 ## Scanner interface
 
-Rasterx takes the path description of lines, bezier curves, and drawing parameters, and converts them into a set of straight line segments before rasterizing the lines to an image using some method of antialiasing. Rasterx abstracts this last step through the Scanner interface. There are two different structs that satisfy the Scanner interface; ScannerGV and [ScannerFT](https://github.com/srwiley/scanFT). ScannerGV wraps the rasterizer found in the golang.org/x/image/vector package. ScannerFT contains a modified version of the antialiaser found in the [golang freetype](https://github.com/golang/freetype) translation. These use different functions to connect an image to the antialiaser. ScannerFT uses a Painter to translate the raster onto the image, and ScannerGV uses the vector's Draw method with a source image and uses the path as an alpha mask. Please see the test files for examples. At this time, the ScannerFT is a bit faster as compared to ScannerGV for larger and less complicated images, while ScannerGV can be faster for smaller and more complex images. Also ScannerGV does not allow for using the even-odd winding rule, which is something the SVG specification uses. Since ScannerFT is subject to freetype style licensing rules, it lives [here](https://github.com/srwiley/scanFT) in a separate repository and must be imported into your project seperately. ScannerGV is included in the rasterx package, and has more go-friendly licensing. 
+Rasterx takes the path description of lines, bezier curves, and drawing parameters, and converts them into a set of straight line segments before rasterizing the lines to an image using some method of antialiasing. Rasterx abstracts this last step through the Scanner interface. There are two different structs that satisfy the Scanner interface; ScannerGV and ScannerFT. ScannerGV wraps the rasterizer found in the golang.org/x/image/vector package. ScannerFT contains a modified version of the antialiaser found in the [golang freetype](https://github.com/golang/freetype) translation. These use different functions to connect an image to the antialiaser. ScannerFT paints the generated spans directly onto a destination `draw.Image`, while ScannerGV uses the vector's Draw method with a source image and uses the path as an alpha mask. Please see the test files for examples. At this time, the ScannerFT is a bit faster as compared to ScannerGV for larger and less complicated images, while ScannerGV can be faster for smaller and more complex images.
+
+### Winding rules: non-zero and even-odd
+
+ScannerGV does not allow for using the even-odd winding rule, which the SVG specification uses for `fill-rule="evenodd"`. ScannerFT supports both rules:
+
+* `scanner.SetWinding(true)` selects the non-zero winding rule (the default).
+* `scanner.SetWinding(false)` selects the even-odd (parity) winding rule.
+
+Under even-odd, every time a scanline crosses the outline the inside/outside state is toggled, so nested holes and self-intersecting paths fill according to the parity of the number of enclosing contours. Reversing a contour's direction does not change an even-odd fill. The rule only affects the `Draw` step, so it can be switched at any time after construction (note that `NewFiller`, `NewStroker` and `NewDasher` reset the rule to non-zero, so call `SetWinding` on the filler/stroker/dasher after constructing them).
+
+```golang
+img := image.NewRGBA(image.Rect(0, 0, w, h))
+scanner := rasterx.NewScannerFT(w, h, img, img.Bounds())
+f := rasterx.NewFiller(w, h, scanner)
+f.SetWinding(false) // even-odd fill
+```
+
+A freetype-style scanner also lives in the separate [scanFT](https://github.com/srwiley/scanFT) repository and must be imported into your project separately; the in-package ScannerFT provides the same algorithm without an extra module.
 
 Below are the results of some benchmarks performed on a sample shape (the letter Q ). The first test is the time it takes to scan the image after all the curves have been flattened. The second test is the time it takes to flatten, and scan a simple filled image. The last test is the time it takes to flatten a stroked and dashed outline of the shape and scan it. Results for three different image sizes are shown.
 
